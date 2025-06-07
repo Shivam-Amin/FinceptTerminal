@@ -1,44 +1,3 @@
-# from textual.screen import Screen, ModalScreen
-# from textual.widgets import Input, Button, Static, OptionList, ProgressBar
-# from textual.containers import Vertical, Center, Grid, VerticalScroll, Container
-# from textual import on
-
-
-# class PredictorTab(Container):
-
-#     def compose(self):
-#         # with Grid(id="dialog"):
-#         #     yield Static("📈 SBI Predictor", classes="title")
-#         #     yield Input(placeholder="Enter path to your SBI CSV", id="csv_path")
-#         #     yield Button("Run Prediction", id="run")
-#         #     yield Button("❌ Close", id="close")
-#         yield Static("🔎 Enter path to CSV file:", id="search_label")
-#         yield Input(placeholder="Enter path...", id="search_input")
-#         yield Button("Run Prediction", id="prediction_button", variant="primary")
-#         # yield Static("🎥 Select a Video:", id="video_label", classes="hidden")
-#         # yield OptionList(id="video_list")
-#         # with VerticalScroll(id="analysis_results", classes="analysis_results"):
-#         #     yield Static("Transcript", id="transcript_label", classes="hidden")
-#         #     yield Static("", id="transcript_display")
-#         #     yield Static("Sentiment Analysis", id="sentiment_label", classes="hidden")
-#         #     yield Static("", id="sentiment_display")
-#         #     yield Button("Download Sentiment Model", id="download_model_button", variant="primary", classes="hidden")
-#         #     yield Static("Model Download Progress:", id="download_progress_label", classes="hidden")
-#         #     yield ProgressBar(id="download_progress_bar", show_percentage=True, show_eta=False, classes="hidden")
-#         #     yield Static("Estimated time left: ?", id="download_eta_label", classes="hidden")  # New ETA label
-    
-#     # @on(Button.Pressed, "#close")
-#     # def close_predictor(self) -> None:
-#     #     self.app.pop_screen()
-
-#     def on_button_pressed(self, event):
-#         # if event.button.id == "close":
-#         #     self.app.pop_screen()
-#         if event.button.id == "run":
-#             path = self.query_one("#csv_path", Input).value
-#             # You can trigger your CSV processing logic here
-#             # await self.app.push_screen(LoadingScreen(path))  # optionally add another screen
-
 import os
 import pandas as pd
 import yaml
@@ -58,7 +17,7 @@ from qlib.data.dataset.handler import DataHandlerLP
 from qlib.contrib.data.handler import Alpha158
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.data import D
-from qlib.constant import REG_CN
+from qlib.constant import REG_US
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -70,6 +29,15 @@ class PredictorTab(Container):
         self.qlib_initialized = False
         self.data_prepared = False
         self.instrument_name = None
+        # Column mapping for flexible CSV formats
+        self.column_aliases = {
+            'date': ['date', 'datetime', 'timestamp', 'time', 'trading_date'],
+            'close': ['close', 'close_price', 'prev_close_price', 'closing_price', 'adj_close', 'adjusted_close', 'price'],
+            'open': ['open', 'opening_price', 'open_price'],
+            'high': ['high', 'high_price', 'highest'],
+            'low': ['low', 'low_price', 'lowest'],
+            'volume': ['volume', 'vol', 'trading_volume', 'shares_traded']
+        }
     
     def compose(self) -> ComposeResult:
         with Vertical(id="predictor_main_layout"):
@@ -81,7 +49,6 @@ class PredictorTab(Container):
             
             with Horizontal(id="predictor_buttons_section"):
                 yield Button("Validate CSV", id="validate_button", variant="default")
-                yield Button("Prepare Data", id="prepare_button", variant="default")
                 yield Button("Run Prediction", id="prediction_button", variant="primary")
                 yield Button("Clear Results", id="clear_button", variant="warning")
             
@@ -94,7 +61,7 @@ class PredictorTab(Container):
         if not self.qlib_initialized:
             try:
                 # Initialize qlib with memory provider for custom data
-                qlib.init(region=REG_CN)
+                qlib.init(region=REG_US)
                 self.qlib_initialized = True
                 self.log_result("✅ Qlib initialized successfully", "success")
                 return True
@@ -103,15 +70,41 @@ class PredictorTab(Container):
                 try:
                     qlib.init()
                     self.qlib_initialized = True
-                    self.log_result("✅ Qlib initialized with default settings", "success")
                     return True
                 except Exception as e2:
                     self.log_result(f"❌ Failed to initialize qlib: {str(e2)}", "error")
                     return False
         return True
     
+    def find_column_mapping(self, df_columns):
+        """Auto-detect and map column names to standard format"""
+        mapping = {}
+        df_columns_lower = [col.lower() for col in df_columns]
+        
+        for standard_col, aliases in self.column_aliases.items():
+            found = False
+            for alias in aliases:
+                if alias.lower() in df_columns_lower:
+                    original_col = df_columns[df_columns_lower.index(alias.lower())]
+                    mapping[original_col] = standard_col
+                    found = True
+                    break
+            
+            if not found and standard_col != 'volume':  # volume is optional
+                # Try partial matches for required columns
+                for col in df_columns:
+                    if standard_col in col.lower():
+                        mapping[col] = standard_col
+                        found = True
+                        break
+                
+                if not found:
+                    return None, f"Could not find column for '{standard_col}'"
+        
+        return mapping, None
+    
     def validate_csv(self, file_path: str) -> bool:
-        """Validate CSV file format and required columns"""
+        """Validate CSV file format with flexible column detection"""
         try:
             if not os.path.exists(file_path):
                 self.log_result(f"❌ File not found: {file_path}", "error")
@@ -120,40 +113,47 @@ class PredictorTab(Container):
             # Read CSV
             df = pd.read_csv(file_path)
             
-            # Check required columns for qlib
-            required_columns = ['date', 'open', 'high', 'low', 'close']
-            optional_columns = ['volume', 'instrument']
-            
-            df_columns_lower = [col.lower() for col in df.columns]
-            missing_required = [col for col in required_columns if col not in df_columns_lower]
-            
-            if missing_required:
-                self.log_result(f"❌ Missing required columns: {missing_required}", "error")
-                self.log_result(f"Available columns: {list(df.columns)}", "info")
-                return False
-            
-            # Check for optional columns
-            missing_optional = [col for col in optional_columns if col not in df_columns_lower]
-            if missing_optional:
-                self.log_result(f"⚠️  Missing optional columns: {missing_optional} (will be added automatically)", "warning")
-            
-            # Basic data validation
             if df.empty:
                 self.log_result("❌ CSV file is empty", "error")
                 return False
             
-            # Check data types and ranges
-            numeric_columns = ['open', 'high', 'low', 'close']
-            for col in numeric_columns:
-                if col in df_columns_lower:
-                    actual_col = df.columns[df_columns_lower.index(col)]
-                    if not pd.api.types.is_numeric_dtype(df[actual_col]):
-                        self.log_result(f"❌ Column '{actual_col}' should be numeric", "error")
+            # Auto-detect column mapping
+            column_mapping, error = self.find_column_mapping(df.columns.tolist())
+            
+            if column_mapping is None:
+                self.log_result(f"❌ {error}", "error")
+                self.log_result(f"Available columns: {list(df.columns)}", "info")
+                self.log_result("Expected columns (or similar): date, open, high, low, close", "info")
+                return False
+            
+            # Apply column mapping for validation
+            df_mapped = df.rename(columns=column_mapping)
+            
+            # Check data types and ranges for required columns
+            required_cols = ['open', 'high', 'low', 'close']
+            for col in required_cols:
+                if col in df_mapped.columns:
+                    if not pd.api.types.is_numeric_dtype(df_mapped[col]):
+                        self.log_result(f"❌ Column '{col}' should be numeric", "error")
                         return False
+            
+            # Basic OHLC validation
+            if all(col in df_mapped.columns for col in required_cols):
+                invalid_ohlc = (df_mapped['high'] < df_mapped['low']) | \
+                              (df_mapped['open'] < 0) | (df_mapped['close'] < 0)
+                if invalid_ohlc.any():
+                    self.log_result("⚠️ Some OHLC data appears invalid (high < low or negative prices)", "warning")
             
             self.log_result(f"✅ CSV validation passed", "success")
             self.log_result(f"📊 Data shape: {df.shape}", "info")
-            self.log_result(f"📅 Date range: {df['date'].min()} to {df['date'].max()}", "info")
+            
+            # Show column mapping
+            self.log_result("📋 Column mapping:", "info")
+            for orig, mapped in column_mapping.items():
+                self.log_result(f"  '{orig}' → '{mapped}'", "info")
+            
+            if 'date' in df_mapped.columns:
+                self.log_result(f"📅 Date range: {df_mapped['date'].min()} to {df_mapped['date'].max()}", "info")
             
             return True
             
@@ -162,17 +162,17 @@ class PredictorTab(Container):
             return False
     
     def prepare_data_for_qlib(self, csv_path: str) -> bool:
-        """Convert CSV data to qlib format and load into qlib"""
+        """Convert CSV data to qlib format with flexible column mapping"""
         try:
-            self.log_result("🔄 Preparing data for qlib...", "info")
-            
             # Read and process CSV
             df = pd.read_csv(csv_path)
             
-            # Standardize column names
-            column_mapping = {}
-            for col in df.columns:
-                column_mapping[col] = col.lower()
+            # Auto-detect and apply column mapping
+            column_mapping, error = self.find_column_mapping(df.columns.tolist())
+            if column_mapping is None:
+                self.log_result(f"❌ {error}", "error")
+                return False
+            
             df = df.rename(columns=column_mapping)
             
             # Get instrument name
@@ -181,13 +181,10 @@ class PredictorTab(Container):
             # Add instrument column if missing
             if 'instrument' not in df.columns:
                 df['instrument'] = self.instrument_name
-                self.log_result(f"✅ Added instrument column: {self.instrument_name}", "success")
             
-            # Add volume column if missing (estimate based on price and typical volume patterns)
+            # Add volume column if missing (estimate based on price)
             if 'volume' not in df.columns:
-                # More sophisticated volume estimation
                 df['volume'] = (df['close'] * np.random.uniform(0.8, 1.2, len(df)) * 1000000).astype(int)
-                self.log_result("✅ Added estimated volume column", "warning")
             
             # Ensure date column is datetime and set as index
             df['datetime'] = pd.to_datetime(df['date'])
@@ -200,18 +197,14 @@ class PredictorTab(Container):
             # Calculate additional features
             df = self.calculate_technical_features(df)
             
-            # Prepare data in qlib format (instrument as column, datetime as index)
+            # Prepare data in qlib format
             qlib_data = {}
             for instrument in df['instrument'].unique():
                 instrument_data = df[df['instrument'] == instrument].drop('instrument', axis=1)
                 qlib_data[instrument] = instrument_data
             
-            # Save data in qlib format (simplified - in production you'd use proper qlib data handlers)
             self.qlib_data = qlib_data
             self.data_prepared = True
-            
-            self.log_result("✅ Data prepared successfully for qlib", "success")
-            self.log_result(f"📈 Instruments prepared: {list(qlib_data.keys())}", "info")
             
             return True
             
@@ -258,7 +251,7 @@ class PredictorTab(Container):
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
             
-            # Fix the variable name error in Bollinger Bands calculation
+            # Bollinger Bands
             bb_window = 20
             bb_std = df['close'].rolling(window=bb_window).std()
             bb_mean = df['close'].rolling(window=bb_window).mean()
@@ -273,7 +266,6 @@ class PredictorTab(Container):
             df['macd_signal'] = df['macd'].ewm(span=9).mean()
             df['macd_histogram'] = df['macd'] - df['macd_signal']
             
-            self.log_result("✅ Technical features calculated", "success")
             return df
             
         except Exception as e:
@@ -315,8 +307,6 @@ class PredictorTab(Container):
             train_data = instrument_data.iloc[:train_end]
             valid_data = instrument_data.iloc[train_end:valid_end]
             test_data = instrument_data.iloc[valid_end:]
-            
-            self.log_result(f"📊 Data split - Train: {len(train_data)}, Valid: {len(valid_data)}, Test: {len(test_data)}", "info")
             
             # Prepare features and labels (exclude non-numeric columns)
             feature_columns = []
@@ -367,17 +357,11 @@ class PredictorTab(Container):
             # Create a clean dataset with only numeric features and target
             clean_data = data[numeric_features + ['target']].copy()
             
-            # Use pandas to handle NaN values comprehensively
-            self.log_result(f"📊 Initial data shape: {clean_data.shape}", "info")
-            self.log_result(f"📊 NaN values per column: {clean_data.isnull().sum().sum()}", "info")
-            
             # Replace infinite values with NaN first
             clean_data = clean_data.replace([np.inf, -np.inf], np.nan)
             
             # Drop rows with any NaN values
             clean_data = clean_data.dropna()
-            
-            self.log_result(f"📊 After cleaning shape: {clean_data.shape}", "info")
             
             if len(clean_data) < 50:
                 self.log_result("❌ Not enough clean data samples (< 50) for training", "error")
@@ -416,15 +400,6 @@ class PredictorTab(Container):
                     self.log_result(f"❌ {name} target contains infinite values", "error")
                     return False
                 
-                # Check for very large values that might cause issues
-                if (np.abs(X) > 1e10).any().any():
-                    self.log_result(f"⚠️  {name} features contain very large values", "warning")
-                
-                # Check variance (features with zero variance can cause issues)
-                zero_var_features = X.var() == 0
-                if zero_var_features.any():
-                    self.log_result(f"⚠️  {name} has {zero_var_features.sum()} zero-variance features", "warning")
-                
                 return True
             
             # Validate data quality
@@ -443,9 +418,6 @@ class PredictorTab(Container):
             X_test_np = X_test.values.astype(np.float64)
             y_test_np = y_test.values.astype(np.float64)
             
-            self.log_result(f"🔄 Training model with {len(X_train_np)} samples and {len(numeric_features)} features...", "info")
-            self.log_result(f"📊 Validation: {len(X_valid_np)} samples, Test: {len(X_test_np)} samples", "info")
-            
             # Use RandomForest with more conservative parameters
             model = RandomForestRegressor(
                 n_estimators=50,  # Reduced from 100
@@ -459,7 +431,6 @@ class PredictorTab(Container):
             # Train the model
             try:
                 model.fit(X_train_np, y_train_np)
-                self.log_result("✅ Model training completed successfully", "success")
             except Exception as e:
                 self.log_result(f"❌ Model training failed: {str(e)}", "error")
                 # Try with even simpler model
@@ -589,30 +560,6 @@ class PredictorTab(Container):
         self.log_result("📊 COMPREHENSIVE QUANT ANALYSIS RESULTS", "info")
         self.log_result("═" * 60, "info")
         
-        # Model Performance
-        self.log_result("🤖 MODEL PERFORMANCE:", "success")
-        self.log_result(f"  Training MSE: {model_results['train_mse']:.6f}", "info")
-        self.log_result(f"  Training MAE: {model_results['train_mae']:.6f}", "info")
-        
-        if 'valid_mse' in model_results:
-            self.log_result(f"  Validation MSE: {model_results['valid_mse']:.6f}", "info")
-            self.log_result(f"  Validation MAE: {model_results['valid_mae']:.6f}", "info")
-        
-        if 'test_mse' in model_results:
-            self.log_result(f"  Test MSE: {model_results['test_mse']:.6f}", "info")
-            self.log_result(f"  Test MAE: {model_results['test_mae']:.6f}", "info")
-        
-        # Feature Importance
-        if hasattr(model_results['model'], 'feature_importances_'):
-            self.log_result("🔍 TOP 10 FEATURE IMPORTANCE:", "success")
-            feature_names = dataset_info['features']
-            importances = model_results['model'].feature_importances_
-            feature_importance = list(zip(feature_names, importances))
-            feature_importance.sort(key=lambda x: x[1], reverse=True)
-            
-            for i, (feature, importance) in enumerate(feature_importance[:10]):
-                self.log_result(f"  {i+1}. {feature}: {importance:.4f}", "info")
-        
         # Portfolio Analysis
         if len(model_results['test_pred']) > 0 and len(model_results['y_test']) > 0:
             portfolio_metrics = self.calculate_portfolio_metrics(
@@ -667,20 +614,6 @@ class PredictorTab(Container):
             return
         
         self.validate_csv(path)
-    
-    @on(Button.Pressed, "#prepare_button")
-    def on_prepare_pressed(self, event: Button.Pressed) -> None:
-        """Handle prepare data button press"""
-        path = self.query_one("#csv_path", Input).value.strip()
-        
-        if not path:
-            self.log_result("❌ Please enter a CSV file path", "error")
-            return
-        
-        if not self.validate_csv(path):
-            return
-        
-        self.prepare_data_for_qlib(path)
     
     @on(Button.Pressed, "#prediction_button")
     def on_prediction_pressed(self, event: Button.Pressed) -> None:
